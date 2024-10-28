@@ -10,6 +10,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"go.goms.io/fleet/pkg/utils/condition"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	"math"
 	"strings"
 	"time"
 
@@ -35,6 +42,8 @@ import (
 const (
 	trafficManagerBackendProfileFieldKey = ".spec.profile.name"
 	trafficManagerBackendBackendFieldKey = ".spec.backend.name"
+	// fields name used to filter resources
+	exportedServiceFieldNamespacedName = ".spec.serviceReference.namespacedName"
 
 	// AzureResourceEndpointNamePrefix is the prefix format of the Azure Traffic Manager Endpoint created by the fleet controller.
 	// The naming convention of a Traffic Manager Endpoint is fleet-{TrafficManagerBackendUUID}#.
@@ -156,27 +165,33 @@ func (r *Reconciler) deleteAzureTrafficManagerEndpoints(ctx context.Context, bac
 		klog.V(2).InfoS("Azure Traffic Manager profile does not exist", "trafficManagerBackend", backendKObj, "trafficManagerProfile", profileKObj, "azureProfileName", azureProfileName)
 		return nil // skip handling endpoints deletion
 	}
-	if getRes.Profile.Properties == nil {
-		klog.V(2).InfoS("Azure Traffic Manager profile has nil properties and skipping handling endpoints deletion", "trafficManagerBackend", backendKObj, "trafficManagerProfile", profileKObj, "azureProfileName", azureProfileName)
+	return r.cleanupEndpoints(ctx, backend, &getRes.Profile)
+}
+
+func (r *Reconciler) cleanupEndpoints(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend, azureProfile *armtrafficmanager.Profile) error {
+	backendKObj := klog.KObj(backend)
+	if azureProfile.Properties == nil {
+		klog.V(2).InfoS("Azure Traffic Manager profile has nil properties and skipping handling endpoints deletion", "trafficManagerBackend", backendKObj, "azureProfileName", azureProfile.Name)
 		return nil
 	}
 
 	klog.V(2).InfoS("Deleting Azure Traffic Manager endpoints", "trafficManagerBackend", backendKObj, "trafficManagerProfile", backend.Spec.Profile.Name)
+	azureProfileName := *azureProfile.Name
 	errs, cctx := errgroup.WithContext(ctx)
-	for i := range getRes.Profile.Properties.Endpoints {
-		endpoint := getRes.Profile.Properties.Endpoints[i]
+	for i := range azureProfile.Properties.Endpoints {
+		endpoint := azureProfile.Properties.Endpoints[i]
 		if endpoint.Name == nil {
 			err := controller.NewUnexpectedBehaviorError(errors.New("azure Traffic Manager endpoint name is nil"))
 			klog.ErrorS(err, "Invalid Traffic Manager endpoint", "azureEndpoint", endpoint)
 			continue
 		}
 		// Traffic manager endpoint name is case-insensitive.
-		if !strings.HasPrefix(strings.ToLower(*endpoint.Name), generateAzureTrafficManagerEndpointNamePrefixFunc(backend)) {
+		if !isEndpointOwnedByBackend(backend, *endpoint.Name) {
 			continue // skipping deleting the endpoints which are not created by this backend
 		}
 		errs.Go(func() error {
 			if _, err := r.EndpointsClient.Delete(cctx, r.ResourceGroupName, azureProfileName, armtrafficmanager.EndpointTypeAzureEndpoints, *endpoint.Name, nil); err != nil {
-				if azureerrors.IsNotFound(getErr) {
+				if azureerrors.IsNotFound(err) {
 					klog.V(2).InfoS("Ignoring NotFound Azure Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", azureProfileName, "azureEndpointName", *endpoint.Name)
 					return nil
 				}
@@ -190,8 +205,415 @@ func (r *Reconciler) deleteAzureTrafficManagerEndpoints(ctx context.Context, bac
 	return errs.Wait()
 }
 
-func (r *Reconciler) handleUpdate(_ context.Context, _ *fleetnetv1alpha1.TrafficManagerBackend) (ctrl.Result, error) {
+func isEndpointOwnedByBackend(backend *fleetnetv1alpha1.TrafficManagerBackend, endpoint string) bool {
+	return strings.HasPrefix(strings.ToLower(endpoint), generateAzureTrafficManagerEndpointNamePrefixFunc(backend))
+}
+
+func (r *Reconciler) handleUpdate(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend) (ctrl.Result, error) {
+	backendKObj := klog.KObj(backend)
+	profile, err := r.validateTrafficManagerProfile(ctx, backend)
+	if err != nil || profile == nil {
+		// We don't need to requeue the invalid Profile as when the profile becomes valid, the controller will be re-triggered again.
+		return ctrl.Result{}, err
+	}
+	klog.V(2).InfoS("Found the valid trafficManagerProfile", "trafficManagerBackend", backendKObj, "trafficManagerProfile", klog.KObj(profile))
+	azureProfile, err := r.validateAzureTrafficManagerProfile(ctx, backend, profile)
+	if err != nil || azureProfile == nil {
+		// We don't need to requeue the invalid Azure Traffic Manager profile as when the profile becomes valid, the controller will be re-triggered again.
+		return ctrl.Result{}, err
+	}
+	klog.V(2).InfoS("Found the valid azure Traffic Manager Profile", "trafficManagerBackend", backendKObj, "trafficManagerProfile", klog.KObj(profile))
+	serviceImport, err := r.validateServiceImportAndCleanupEndpointsIfInvalid(ctx, backend, azureProfile)
+	if err != nil || serviceImport == nil {
+		// We don't need to requeue the invalid serviceImport as when the serviceImport becomes valid, the controller will be re-triggered again.
+		return ctrl.Result{}, err
+	}
+	klog.V(2).InfoS("Found the serviceImport", "trafficManagerBackend", backendKObj, "serviceImport", klog.KObj(serviceImport), "clusters", serviceImport.Status.Clusters)
+	desiredEndpointsMaps, invalidServicesMaps, err := r.validateExportedServiceForServiceImport(ctx, backend, serviceImport)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.updateTrafficManagerEndpoints(ctx, backend, azureProfile, desiredEndpointsMaps); err != nil {
+		return ctrl.Result{}, err
+	}
+	var cond metav1.Condition
+	if len(invalidServicesMaps) > 0 {
+		for clusterID, invalidServiceErr := range invalidServicesMaps {
+			message := fmt.Sprintf("%v service(s) exported from clusters cannot be exposed as the Azure Traffic Manager, for example, service exported from %v is invalid: %v", len(invalidServicesMaps), clusterID, invalidServiceErr)
+			cond = metav1.Condition{
+				Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: backend.Generation,
+				Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonInvalid),
+				Message:            message,
+			}
+			break
+		}
+	} else {
+		cond = metav1.Condition{
+			Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: backend.Generation,
+			Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonAccepted),
+			Message:            fmt.Sprintf("%v service(s) exported from clusters have been accepted as Traffic Manager endpoints", len(desiredEndpointsMaps)),
+		}
+	}
+	meta.SetStatusCondition(&backend.Status.Conditions, cond)
+	klog.V(2).InfoS("Updated Traffic Manager endpoints for the serviceImport and updating the condition", "trafficManagerBackend", backendKObj, "status", backend.Status)
+	if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
+}
+
+func setUnknownCondition(backend *fleetnetv1alpha1.TrafficManagerBackend, message string) {
+	cond := metav1.Condition{
+		Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+		Status:             metav1.ConditionUnknown,
+		ObservedGeneration: backend.Generation,
+		Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonPending),
+		Message:            message,
+	}
+	backend.Status.Endpoints = []fleetnetv1alpha1.TrafficManagerEndpointStatus{}
+	meta.SetStatusCondition(&backend.Status.Conditions, cond)
+}
+
+type desiredEndpoint struct {
+	Endpoint armtrafficmanager.Endpoint
+	Cluster  fleetnetv1alpha1.ClusterStatus
+}
+
+// validateExportedServiceForServiceImport returns two maps:
+// * a map of desired endpoints for the serviceImport (key is the endpoint name).
+// * a map of invalid services which cannot be exposed as the trafficManagerEndpoints (key is the cluster name).
+func (r *Reconciler) validateExportedServiceForServiceImport(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend, serviceImport *fleetnetv1alpha1.ServiceImport) (map[string]desiredEndpoint, map[string]error, error) {
+	backendKObj := klog.KObj(backend)
+	serviceImportKObj := klog.KObj(serviceImport)
+	internalServiceExportList := &fleetnetv1alpha1.InternalServiceExportList{}
+	namespaceName := types.NamespacedName{Namespace: serviceImport.Namespace, Name: serviceImport.Name}
+	listOpts := client.MatchingFields{
+		exportedServiceFieldNamespacedName: namespaceName.String(),
+	}
+	if listErr := r.Client.List(ctx, internalServiceExportList, &listOpts); listErr != nil {
+		klog.ErrorS(listErr, "Failed to list internalServiceExports used by the serviceImport", "trafficManagerBackend", backendKObj, "serviceImport", serviceImportKObj)
+		setUnknownCondition(backend, fmt.Sprintf("Failed to list the exported service %q: %v", namespaceName, listErr))
+		if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, listErr
+	}
+	internalServiceExportMap := make(map[string]*fleetnetv1alpha1.InternalServiceExport, len(internalServiceExportList.Items))
+	for i, export := range internalServiceExportList.Items {
+		internalServiceExportMap[export.Spec.ServiceReference.ClusterID] = &internalServiceExportList.Items[i]
+	}
+
+	desiredEndpoints := make(map[string]desiredEndpoint, len(serviceImport.Status.Clusters)) // key is the endpoint name
+	invalidServices := make(map[string]error, len(serviceImport.Status.Clusters))            // key is cluster name
+	for _, clusterStatus := range serviceImport.Status.Clusters {
+		internalServiceExport, ok := internalServiceExportMap[clusterStatus.Cluster]
+		if !ok {
+			getErr := fmt.Errorf("failed to find the internalServiceExport for the cluster %q", clusterStatus.Cluster)
+			klog.ErrorS(getErr, "InternalServiceExport not found for the cluster", "trafficManagerBackend", backendKObj, "serviceImport", serviceImportKObj, "clusterID", clusterStatus.Cluster)
+			setUnknownCondition(backend, fmt.Sprintf("Failed to find the exported service %q for %q: %v", namespaceName, clusterStatus.Cluster, getErr))
+			if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+				return nil, nil, err
+			}
+			return nil, nil, getErr
+		}
+		if err := isValidTrafficManagerEndpoint(internalServiceExport); err != nil {
+			invalidServices[clusterStatus.Cluster] = err
+			klog.V(2).InfoS("Invalid service for TrafficManager endpoint", "trafficManagerBackend", backendKObj, "serviceImport", serviceImportKObj, "clusterID", clusterStatus.Cluster, "error", err)
+			continue
+		}
+		endpoint := generateAzureTrafficManagerEndpoint(backend, internalServiceExport)
+		desiredEndpoints[*endpoint.Name] = desiredEndpoint{Endpoint: endpoint, Cluster: clusterStatus}
+	}
+	desiredWeight := int(math.Ceil(float64(*backend.Spec.Weight) / float64(len(desiredEndpoints))))
+	for _, dp := range desiredEndpoints {
+		dp.Endpoint.Properties.Weight = ptr.To(int64(desiredWeight))
+	}
+	klog.V(2).InfoS("Finishing validating services", "trafficManagerBackend", backendKObj, "serviceImport", serviceImportKObj, "numberOfDesiredEndpoints", len(desiredEndpoints), "numberOfInvalidServices", len(invalidServices), "desiredWeight", desiredWeight)
+	return desiredEndpoints, invalidServices, nil
+}
+
+func generateAzureTrafficManagerEndpoint(backend *fleetnetv1alpha1.TrafficManagerBackend, service *fleetnetv1alpha1.InternalServiceExport) armtrafficmanager.Endpoint {
+	endpointName := fmt.Sprintf(AzureResourceEndpointNameFormat, backend.UID, backend.Spec.Backend, service.Spec.ServiceReference.ClusterID)
+	return armtrafficmanager.Endpoint{
+		Name: &endpointName,
+		Type: ptr.To(string(armtrafficmanager.EndpointTypeAzureEndpoints)),
+		Properties: &armtrafficmanager.EndpointProperties{
+			TargetResourceID: service.Spec.PublicIPResourceID,
+			EndpointStatus:   ptr.To(armtrafficmanager.EndpointStatusEnabled),
+		},
+	}
+}
+
+func (r *Reconciler) updateTrafficManagerEndpoints(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend, profile *armtrafficmanager.Profile, desiredEndpoints map[string]desiredEndpoint) error {
+	backendKObj := klog.KObj(backend)
+	acceptedEndpoints := make([]fleetnetv1alpha1.TrafficManagerEndpointStatus, 0, len(desiredEndpoints))
+	backend.Status.Endpoints = acceptedEndpoints
+	for _, endpoint := range profile.Properties.Endpoints {
+		if endpoint.Name == nil {
+			err := controller.NewUnexpectedBehaviorError(errors.New("azure Traffic Manager endpoint name is nil"))
+			klog.ErrorS(err, "Invalid Traffic Manager endpoint", "azureEndpoint", endpoint)
+			continue
+		}
+
+		if !isEndpointOwnedByBackend(backend, *endpoint.Name) {
+			continue // skipping the endpoint which is owned by this backend
+		}
+
+		desired, ok := desiredEndpoints[*endpoint.Name]
+		if !ok {
+			klog.V(2).InfoS("Deleting the Azure Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpointName", *endpoint.Name)
+			if _, deleteErr := r.EndpointsClient.Delete(ctx, r.ResourceGroupName, *profile.Name, armtrafficmanager.EndpointTypeAzureEndpoints, *endpoint.Name, nil); deleteErr != nil {
+				if azureerrors.IsNotFound(deleteErr) {
+					klog.V(2).InfoS("Ignoring NotFound Azure Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpointName", *endpoint.Name)
+					continue
+				}
+				klog.ErrorS(deleteErr, "Failed to delete the Azure Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpointName", *endpoint.Name)
+				setUnknownCondition(backend, fmt.Sprintf("Failed to cleanup the existing %q for %q: %v", *endpoint.Name, *profile.Name, deleteErr))
+				if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+					return err
+				}
+				return deleteErr
+			}
+		}
+		if compareEndpoints(*endpoint, desired.Endpoint) {
+			klog.V(2).InfoS("Skipping updating the existing Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpointName", *endpoint.Name)
+			delete(desiredEndpoints, *endpoint.Name) // no need to update the existing endpoint
+			acceptedEndpoints = append(acceptedEndpoints, buildAcceptedEndpointStatus(endpoint, &desired.Cluster))
+			continue
+		}
+		endpoint.Type = desired.Endpoint.Type
+		if endpoint.Properties == nil {
+			endpoint.Properties = desired.Endpoint.Properties
+		} else {
+			endpoint.Properties.TargetResourceID = desired.Endpoint.Properties.TargetResourceID
+			endpoint.Properties.Weight = desired.Endpoint.Properties.Weight
+			endpoint.Properties.EndpointStatus = desired.Endpoint.Properties.EndpointStatus
+		}
+		klog.V(2).InfoS("Updating the existing Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpoint", endpoint)
+		updatedEndpoint, err := r.createOrUpdateTrafficManagerEndpoint(ctx, backend, profile, endpoint)
+		if err != nil {
+			return err
+		}
+		delete(desiredEndpoints, *endpoint.Name)
+		acceptedEndpoints = append(acceptedEndpoints, buildAcceptedEndpointStatus(updatedEndpoint, &desired.Cluster))
+	}
+	// The remaining endpoints in the desiredEndpoints should be created.
+	for _, endpoint := range desiredEndpoints {
+		klog.V(2).InfoS("Creating new Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpoint", endpoint)
+		updatedEndpoint, err := r.createOrUpdateTrafficManagerEndpoint(ctx, backend, profile, &endpoint.Endpoint)
+		if err != nil {
+			return err
+		}
+		acceptedEndpoints = append(acceptedEndpoints, buildAcceptedEndpointStatus(updatedEndpoint, &endpoint.Cluster))
+	}
+	return nil
+}
+
+func buildAcceptedEndpointStatus(endpoint *armtrafficmanager.Endpoint, cluster *fleetnetv1alpha1.ClusterStatus) fleetnetv1alpha1.TrafficManagerEndpointStatus {
+	return fleetnetv1alpha1.TrafficManagerEndpointStatus{
+		Name:    *endpoint.Name,
+		Target:  endpoint.Properties.Target,
+		Weight:  endpoint.Properties.Weight,
+		Cluster: cluster,
+	}
+}
+
+func (r *Reconciler) createOrUpdateTrafficManagerEndpoint(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend, profile *armtrafficmanager.Profile, endpoint *armtrafficmanager.Endpoint) (*armtrafficmanager.Endpoint, error) {
+	backendKObj := klog.KObj(backend)
+	var responseError *azcore.ResponseError
+	res, updateErr := r.EndpointsClient.CreateOrUpdate(ctx, r.ResourceGroupName, *profile.Name, armtrafficmanager.EndpointTypeAzureEndpoints, *endpoint.Name, *endpoint, nil)
+	if updateErr != nil {
+		if !errors.As(updateErr, &responseError) {
+			klog.ErrorS(updateErr, "Failed to send the createOrUpdate request", "trafficManagerBackend", backendKObj, "azureProfileName", *profile.Name, "azureEndpointName", *endpoint.Name)
+			return nil, updateErr
+		}
+		var cond metav1.Condition
+		if azureerrors.IsClientError(updateErr) && !azureerrors.IsThrottled(updateErr) {
+			cond = metav1.Condition{
+				Type:               string(fleetnetv1alpha1.TrafficManagerBackendReasonInvalid),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: backend.Generation,
+				Reason:             string(fleetnetv1alpha1.TrafficManagerProfileReasonInvalid),
+				Message:            fmt.Sprintf("Invalid Traffic Manager endpoint: %v", updateErr),
+			}
+			meta.SetStatusCondition(&backend.Status.Conditions, cond)
+			return nil, r.updateTrafficManagerBackendStatus(ctx, backend) // requeue won't help until the exported services are updated
+		} else if updateErr != nil {
+			setUnknownCondition(backend, fmt.Sprintf("Failed to create or update %q for %q: %v", *endpoint.Name, *profile.Name, updateErr))
+			if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+				return nil, err
+			}
+			return nil, updateErr
+		}
+	}
+	klog.V(2).InfoS("Created or updated Traffic Manager endpoint", "trafficManagerBackend", backendKObj, "azureProfileName", profile.Name, "azureEndpointName", *endpoint.Name)
+	return &res.Endpoint, nil
+}
+
+// The desired endpoint is built by the controllers and all the required fields should not be nil.
+func compareEndpoints(current, desired armtrafficmanager.Endpoint) bool {
+	if current.Type == nil ||
+		current.Properties == nil ||
+		current.Properties.TargetResourceID == nil ||
+		current.Properties.Weight == nil ||
+		current.Properties.EndpointStatus == nil {
+		return false
+	}
+	return *current.Type == *desired.Type &&
+		*current.Properties.TargetResourceID == *desired.Properties.TargetResourceID &&
+		*current.Properties.Weight == *desired.Properties.Weight &&
+		*current.Properties.EndpointStatus == *desired.Properties.EndpointStatus
+}
+
+// isValidTrafficManagerEndpoint returns error if the service cannot be added as a TrafficManager endpoint.
+func isValidTrafficManagerEndpoint(export *fleetnetv1alpha1.InternalServiceExport) error {
+	if export.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		return fmt.Errorf("unsupported service type %q", export.Spec.Type)
+	}
+	if export.Spec.IsInternalLoadBalancer == true {
+		return fmt.Errorf("internal load balancer is not supported")
+	}
+	if export.Spec.IsDNSLabelConfigured == false {
+		return fmt.Errorf("DNS label is not configured to the public IP")
+	}
+	return nil
+}
+
+// validateAzureTrafficManagerProfile returns not nil Azure Traffic Manager profile when the profile is valid.
+func (r *Reconciler) validateAzureTrafficManagerProfile(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend, profile *fleetnetv1alpha1.TrafficManagerProfile) (*armtrafficmanager.Profile, error) {
+	azureProfileName := generateAzureTrafficManagerProfileNameFunc(profile)
+	backendKObj := klog.KObj(backend)
+	profileKObj := klog.KObj(profile)
+	var cond metav1.Condition
+	getRes, getErr := r.ProfilesClient.Get(ctx, r.ResourceGroupName, azureProfileName, nil)
+	if getErr != nil {
+		if azureerrors.IsNotFound(getErr) {
+			// We've already checked the TrafficManagerProfile condition before getting Azure resource.
+			// It may happen when
+			// 1. customers delete the azure profile manually
+			// 2. the TrafficManagerProfile info is stale.
+			// For the case 1, retry won't help to recover the Azure Traffic Manager profile resource.
+			// For the case 2, the controller will be re-triggered when the TrafficManagerProfile is updated.
+			klog.ErrorS(getErr, "NotFound Azure Traffic Manager profile", "trafficManagerBackend", backendKObj, "trafficManagerProfile", profileKObj, "azureProfileName", azureProfileName)
+			cond = metav1.Condition{
+				Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: backend.Generation,
+				Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonInvalid),
+				Message:            fmt.Sprintf("Azure Traffic Manager profile %q is not found", azureProfileName),
+			}
+			meta.SetStatusCondition(&backend.Status.Conditions, cond)
+			backend.Status.Endpoints = []fleetnetv1alpha1.TrafficManagerEndpointStatus{} // none of the endpoints are accepted by the TrafficManager
+			return nil, r.updateTrafficManagerBackendStatus(ctx, backend)
+		}
+		klog.V(2).InfoS("Failed to get Azure Traffic Manager profile", "trafficManagerBackend", backendKObj, "trafficManagerProfile", profileKObj, "azureProfileName", azureProfileName)
+		setUnknownCondition(backend, fmt.Sprintf("Failed to get the Azure Traffic Manager profile %q: %v", azureProfileName, getErr))
+		if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+			return nil, err
+		}
+		return nil, getErr // need to return the error to requeue the request
+	}
+	return &getRes.Profile, nil
+}
+
+// validateTrafficManagerProfile returns not nil profile when the profile is valid.
+func (r *Reconciler) validateTrafficManagerProfile(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend) (*fleetnetv1alpha1.TrafficManagerProfile, error) {
+	backendKObj := klog.KObj(backend)
+	var cond metav1.Condition
+	profile := &fleetnetv1alpha1.TrafficManagerProfile{}
+	if getProfileErr := r.Client.Get(ctx, types.NamespacedName{Name: backend.Spec.Profile.Name, Namespace: backend.Namespace}, profile); getProfileErr != nil {
+		if apierrors.IsNotFound(getProfileErr) {
+			klog.V(2).InfoS("NotFound trafficManagerProfile", "trafficManagerBackend", backendKObj, "trafficManagerProfile", backend.Spec.Profile.Name)
+			cond = metav1.Condition{
+				Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: backend.Generation,
+				Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonInvalid),
+				Message:            fmt.Sprintf("TrafficManagerProfile %q is not found", backend.Spec.Profile.Name),
+			}
+			meta.SetStatusCondition(&backend.Status.Conditions, cond)
+			backend.Status.Endpoints = []fleetnetv1alpha1.TrafficManagerEndpointStatus{}
+			return nil, r.updateTrafficManagerBackendStatus(ctx, backend)
+		} else {
+			klog.ErrorS(getProfileErr, "Failed to get trafficManagerProfile", "trafficManagerBackend", backendKObj, "trafficManagerProfile", backend.Spec.Profile.Name)
+			setUnknownCondition(backend, fmt.Sprintf("Failed to get the trafficManagerProfile %q: %v", backend.Spec.Profile.Name, getProfileErr))
+			if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+				return nil, err
+			}
+			return nil, getProfileErr // need to return the error to requeue the request
+		}
+	}
+	programmedCondition := meta.FindStatusCondition(profile.Status.Conditions, string(fleetnetv1alpha1.TrafficManagerProfileConditionProgrammed))
+	if condition.IsConditionStatusTrue(programmedCondition, profile.GetGeneration()) {
+		return profile, nil // return directly if the trafficManagerProfile is programmed
+	} else if condition.IsConditionStatusFalse(programmedCondition, profile.GetGeneration()) {
+		cond = metav1.Condition{
+			Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: backend.Generation,
+			Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonInvalid),
+			Message:            fmt.Sprintf("Invalid trafficManagerProfile %q: %v", backend.Spec.Profile.Name, programmedCondition.Message),
+		}
+	} else {
+		cond = metav1.Condition{
+			Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+			Status:             metav1.ConditionUnknown,
+			ObservedGeneration: backend.Generation,
+			Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonPending),
+			Message:            fmt.Sprintf("In the processing of trafficManagerProfile %q: %v", backend.Spec.Profile.Name, programmedCondition.Message),
+		}
+	}
+	klog.V(2).InfoS("Profile has not been accepted and updating the status", "trafficManagerBackend", backendKObj, "condition", cond)
+	meta.SetStatusCondition(&backend.Status.Conditions, cond)
+	backend.Status.Endpoints = []fleetnetv1alpha1.TrafficManagerEndpointStatus{}
+	return nil, r.updateTrafficManagerBackendStatus(ctx, backend)
+}
+
+// validateServiceImportAndCleanupEndpointsIfInvalid returns not nil serviceImport when the serviceImport is valid.
+func (r *Reconciler) validateServiceImportAndCleanupEndpointsIfInvalid(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend, azureProfile *armtrafficmanager.Profile) (*fleetnetv1alpha1.ServiceImport, error) {
+	backendKObj := klog.KObj(backend)
+	var cond metav1.Condition
+	serviceImport := &fleetnetv1alpha1.ServiceImport{}
+	if getServiceImportErr := r.Client.Get(ctx, types.NamespacedName{Name: backend.Spec.Backend.Name, Namespace: backend.Namespace}, serviceImport); getServiceImportErr != nil {
+		if apierrors.IsNotFound(getServiceImportErr) {
+			klog.V(2).InfoS("NotFound serviceImport and starting deleting any stale endpoints", "trafficManagerBackend", backendKObj, "serviceImport", backend.Spec.Backend.Name)
+			if err := r.cleanupEndpoints(ctx, backend, azureProfile); err != nil {
+				klog.ErrorS(err, "Failed to delete stale endpoints for an invalid serviceImport", "trafficManagerBackend", backendKObj, "serviceImport", backend.Spec.Backend.Name)
+				return nil, err
+			}
+			cond = metav1.Condition{
+				Type:               string(fleetnetv1alpha1.TrafficManagerBackendConditionAccepted),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: backend.Generation,
+				Reason:             string(fleetnetv1alpha1.TrafficManagerBackendReasonInvalid),
+				Message:            fmt.Sprintf("ServiceImport %q is not found", backend.Spec.Backend.Name),
+			}
+			meta.SetStatusCondition(&backend.Status.Conditions, cond)
+			backend.Status.Endpoints = []fleetnetv1alpha1.TrafficManagerEndpointStatus{} // none of the endpoints are accepted by the TrafficManager
+			return nil, r.updateTrafficManagerBackendStatus(ctx, backend)
+		}
+		klog.ErrorS(getServiceImportErr, "Failed to get serviceImport", "trafficManagerBackend", backendKObj, "serviceImport", backend.Spec.Backend.Name)
+		setUnknownCondition(backend, fmt.Sprintf("Failed to get the serviceImport %q: %v", backend.Spec.Profile.Name, getServiceImportErr))
+		if err := r.updateTrafficManagerBackendStatus(ctx, backend); err != nil {
+			return nil, err
+		}
+		return nil, getServiceImportErr // need to return the error to requeue the request
+	}
+	return serviceImport, nil
+}
+
+func (r *Reconciler) updateTrafficManagerBackendStatus(ctx context.Context, backend *fleetnetv1alpha1.TrafficManagerBackend) error {
+	backendKObj := klog.KObj(backend)
+	if err := r.Client.Status().Update(ctx, backend); err != nil {
+		klog.ErrorS(err, "Failed to update trafficManagerBackend status", "trafficManagerBackend", backendKObj)
+		return controller.NewUpdateIgnoreConflictError(err)
+	}
+	klog.V(2).InfoS("Updated trafficManagerBackend status", "trafficManagerBackend", backendKObj, "status", backend.Status)
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -221,6 +643,16 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) err
 		return err
 	}
 
+	// add index to quickly query internalServiceExport list by service
+	extractFunc := func(o client.Object) []string {
+		name := o.(*fleetnetv1alpha1.InternalServiceExport).Spec.ServiceReference.NamespacedName
+		return []string{name}
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &fleetnetv1alpha1.InternalServiceExport{}, exportedServiceFieldNamespacedName, extractFunc); err != nil {
+		klog.ErrorS(err, "Failed to create index", "field", exportedServiceFieldNamespacedName)
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetnetv1alpha1.TrafficManagerBackend{}).
 		Watches(
@@ -230,6 +662,10 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) err
 		Watches(
 			&fleetnetv1alpha1.ServiceImport{},
 			handler.EnqueueRequestsFromMapFunc(r.serviceImportEventHandler()),
+		).
+		Watches(
+			&fleetnetv1alpha1.InternalServiceExport{},
+			handler.EnqueueRequestsFromMapFunc(r.internalServiceExportEventHandler()),
 		).
 		Complete(r)
 }
@@ -263,27 +699,57 @@ func (r *Reconciler) trafficManagerProfileEventHandler() handler.MapFunc {
 
 func (r *Reconciler) serviceImportEventHandler() handler.MapFunc {
 	return func(ctx context.Context, object client.Object) []reconcile.Request {
-		trafficManagerBackendList := &fleetnetv1alpha1.TrafficManagerBackendList{}
-		fieldMatcher := client.MatchingFields{
-			trafficManagerBackendBackendFieldKey: object.GetName(),
-		}
-		// ServiceImport and TrafficManagerBackend should be in the same namespace.
-		if err := r.Client.List(ctx, trafficManagerBackendList, client.InNamespace(object.GetNamespace()), fieldMatcher); err != nil {
-			klog.ErrorS(err,
-				"Failed to list trafficManagerBackends for the serviceImport",
-				"serviceImport", klog.KObj(object))
+		return r.enqueueTrafficManagerBackendByServiceImport(ctx, object)
+	}
+}
+
+func (r *Reconciler) enqueueTrafficManagerBackendByServiceImport(ctx context.Context, object client.Object) []reconcile.Request {
+	trafficManagerBackendList := &fleetnetv1alpha1.TrafficManagerBackendList{}
+	fieldMatcher := client.MatchingFields{
+		trafficManagerBackendBackendFieldKey: object.GetName(),
+	}
+	// ServiceImport and TrafficManagerBackend should be in the same namespace.
+	if err := r.Client.List(ctx, trafficManagerBackendList, client.InNamespace(object.GetNamespace()), fieldMatcher); err != nil {
+		klog.ErrorS(err,
+			"Failed to list trafficManagerBackends for the serviceImport",
+			"serviceImport", klog.KObj(object))
+		return []reconcile.Request{}
+	}
+
+	res := make([]reconcile.Request, 0, len(trafficManagerBackendList.Items))
+	for _, backend := range trafficManagerBackendList.Items {
+		res = append(res, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: backend.Namespace,
+				Name:      backend.Name,
+			},
+		})
+	}
+	return res
+}
+
+func (r *Reconciler) internalServiceExportEventHandler() handler.MapFunc {
+	return func(ctx context.Context, object client.Object) []reconcile.Request {
+		internalServiceExport, ok := object.(*fleetnetv1alpha1.InternalServiceExport)
+		if !ok {
 			return []reconcile.Request{}
 		}
 
-		res := make([]reconcile.Request, 0, len(trafficManagerBackendList.Items))
-		for _, backend := range trafficManagerBackendList.Items {
-			res = append(res, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: backend.Namespace,
-					Name:      backend.Name,
-				},
-			})
+		serviceImport := &fleetnetv1alpha1.ServiceImport{}
+		serviceImportName := types.NamespacedName{Namespace: internalServiceExport.Spec.ServiceReference.Namespace, Name: internalServiceExport.Spec.ServiceReference.Name}
+		serviceImportKRef := klog.KRef(serviceImportName.Namespace, serviceImportName.Name)
+		if err := r.Client.Get(ctx, serviceImportName, serviceImport); err != nil {
+			klog.ErrorS(err, "Failed to get serviceImport", "serviceImport", serviceImportKRef, "internalServiceExport", klog.KObj(internalServiceExport))
+			return []reconcile.Request{}
 		}
-		return res
+		for _, cs := range serviceImport.Status.Clusters {
+			// When cluster is part of the ServiceImport, the ServiceImport event will re-trigger the controller.
+			// Here we ignore such clusters which either has not been handled by the serviceImport or it has conflicts with
+			// other clusters.
+			if cs.Cluster == internalServiceExport.Spec.ServiceReference.ClusterID {
+				return r.enqueueTrafficManagerBackendByServiceImport(ctx, serviceImport)
+			}
+		}
+		return []reconcile.Request{}
 	}
 }
