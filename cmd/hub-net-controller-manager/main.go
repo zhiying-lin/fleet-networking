@@ -10,6 +10,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"go.goms.io/fleet-networking/pkg/common/hubconfig"
 	"os"
 	"time"
 
@@ -207,11 +208,18 @@ func main() {
 			klog.ErrorS(err, "Unable to create Azure Traffic Manager clients")
 			exitWithErrorFunc()
 		}
+
+		fleetManagedResourceGroup := os.Getenv(hubconfig.FleetManagedAzureResourceGroupEnvKey)
+		if len(fleetManagedResourceGroup) == 0 {
+			klog.ErrorS(err, "Failed to get the fleet managed Azure resource group")
+			exitWithErrorFunc()
+		}
+
 		klog.V(1).InfoS("Start to setup TrafficManagerProfile controller")
 		if err := (&trafficmanagerprofile.Reconciler{
 			Client:            mgr.GetClient(),
 			ProfilesClient:    profilesClient,
-			ResourceGroupName: cloudConfig.ResourceGroup,
+			ResourceGroupName: fleetManagedResourceGroup,
 		}).SetupWithManager(mgr); err != nil {
 			klog.ErrorS(err, "Unable to create TrafficManagerProfile controller")
 			exitWithErrorFunc()
@@ -222,7 +230,7 @@ func main() {
 			Client:            mgr.GetClient(),
 			ProfilesClient:    profilesClient,
 			EndpointsClient:   endpointsClient,
-			ResourceGroupName: cloudConfig.ResourceGroup,
+			ResourceGroupName: fleetManagedResourceGroup,
 			// serviceImport controller has already enabled the internalServiceExportIndexer.
 			// Therefore, no need to setup it again.
 		}).SetupWithManager(ctx, mgr, true); err != nil {

@@ -16,6 +16,7 @@ leaderElectionNamespace: fleet-system
 fleetSystemNamespace: fleet-system
 forceDeleteWaitTime: 2m0s
 enableTrafficManagerFeature: false
+fleetManagedAzureResourceGroup: ""
 
 resources:
   limits:

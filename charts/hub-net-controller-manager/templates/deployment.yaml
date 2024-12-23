@@ -48,6 +48,9 @@ spec:
             httpGet:
               path: /readyz
               port: healthz
+          env:
+          - name: FLEET_MANAGED_AZURE_RESOURCE_GROUP
+            value: {{ .Values.fleetManagedAzureResourceGroup }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- if .Values.enableTrafficManagerFeature }}

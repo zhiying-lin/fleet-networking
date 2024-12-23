@@ -35,6 +35,9 @@ const (
 	// Naming pattern of member cluster namespace in hub cluster, should be the same as envValue as defined in
 	// https://github.com/Azure/fleet/blob/main/pkg/utils/common.go
 	HubNamespaceNameFormat = "fleet-member-%s"
+
+	// FleetManagedAzureResourceGroupEnvKey is the environment variable key for the Azure resource group that Fleet manages.
+	FleetManagedAzureResourceGroupEnvKey = "FLEET_MANAGED_AZURE_RESOURCE_GROUP"
 )
 
 // PrepareHubConfig return the config holding attributes for a Kubernetes client to request hub cluster.

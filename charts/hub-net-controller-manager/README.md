@@ -41,10 +41,11 @@ helm upgrade hub-net-controller-manager ./charts/hub-net-controller-manager/
 | affinity | The node affinity to use for pod scheduling | `{}` |
 | tolerations | The toleration to use for pod scheduling | `[]` |
 | azureCloudConfig | The Azure cloud provider configuration | **required if AzureTrafficManager feature is enabled (enableTrafficManagerFeature == true)** |
+| fleetManagedAzureResourceGroup | Azure resource group that the fleet manages                                                                     | **required if AzureTrafficManager feature is enabled (enableTrafficManagerFeature == true)** |
 
-## Override Azure cloud config
+## Override Azure cloud config and fleetManagedAzureResourceGroup
 
-**If AzureTrafficManager feature is enabled, then an Azure cloud configuration is required.** Azure cloud configuration provides resource metadata and credentials for `fleet-hub-net-controller-manager` and `fleet-member-net-controller-manager` to manipulate Azure resources. It's embedded into a Kubernetes secret and mounted to the pods. The values can be modified under `config.azureCloudConfig` section in values.yaml or can be provided as a separate file.
+**If AzureTrafficManager feature is enabled, both an Azure cloud configuration and fleetManagedAzureResourceGroup are required.** Azure cloud configuration provides resource metadata and credentials for `fleet-hub-net-controller-manager` and `fleet-member-net-controller-manager` to manipulate Azure resources. It's embedded into a Kubernetes secret and mounted to the pods. The values can be modified under `config.azureCloudConfig` section in values.yaml or can be provided as a separate file.
 
 | configuration value                                   | description | Remark                                                                               |
 |-------------------------------------------------------| --- |--------------------------------------------------------------------------------------|
@@ -59,7 +60,7 @@ helm upgrade hub-net-controller-manager ./charts/hub-net-controller-manager/
 | `userAgent`                   | The userAgent provided to Azure when accessing Azure resources. | |
 | `location`                    | The azure region where resource group and its resources is deployed. |  |
 
-You can create a file `azure.yaml` with the following content, and pass it to `helm install` command: `helm install <release-name> <chart-name> --set enableTrafficManagerFeature=true -f azure.yaml`
+You can create a file `azure.yaml` with the following content, and pass it to `helm install` command: `helm install <release-name> <chart-name> --set enableTrafficManagerFeature=true --set fleetManagedAzureResourceGroup=<my-rg> -f azure.yaml`
 
 ```yaml
 azureCloudConfig:
